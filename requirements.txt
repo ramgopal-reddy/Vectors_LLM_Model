@@ -1,11 +1,8 @@
 fastapi
 uvicorn
 gunicorn
-pandas
 numpy
+pandas
 faiss-cpu
+requests
 google-generativeai
-
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.10.0+cpu
-sentence-transformers==5.2.3
