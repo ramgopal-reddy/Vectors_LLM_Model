@@ -4,6 +4,8 @@ gunicorn
 pandas
 numpy
 faiss-cpu
-sentence-transformers
 google-generativeai
-torch
+
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.2.2+cpu
+sentence-transformers==2.6.1
