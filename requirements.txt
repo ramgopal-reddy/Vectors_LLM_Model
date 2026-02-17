@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+gunicorn
+pandas
+numpy
+faiss-cpu
+sentence-transformers
+google-generativeai
+torch
