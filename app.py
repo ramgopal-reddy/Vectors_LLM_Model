@@ -149,27 +149,36 @@ def apply_filters(dataframe, params):
 
     filtered = dataframe.copy()
 
-    if params.get("max_price"):
-        filtered = filtered[filtered["price"] <= params["max_price"]]
+    # Ensure numeric columns are properly typed
+    if "price" in filtered.columns:
+        filtered["price"] = pd.to_numeric(filtered["price"], errors="coerce")
 
-    if params.get("min_rating"):
-        filtered = filtered[filtered["rating"] >= params["min_rating"]]
+    if "rating" in filtered.columns:
+        filtered["rating"] = pd.to_numeric(filtered["rating"], errors="coerce")
+
+    # Apply filters safely
+    if params.get("max_price") is not None:
+        filtered = filtered[filtered["price"] <= float(params["max_price"])]
+
+    if params.get("min_rating") is not None:
+        filtered = filtered[filtered["rating"] >= float(params["min_rating"])]
 
     if params.get("category"):
         filtered = filtered[
-            filtered["clean_category"].str.contains(
-                params["category"], case=False, na=False
+            filtered["clean_category"].astype(str).str.contains(
+                str(params["category"]), case=False, na=False
             )
         ]
 
     if params.get("brand"):
         filtered = filtered[
-            filtered["supplier_name"].str.contains(
-                params["brand"], case=False, na=False
+            filtered["supplier_name"].astype(str).str.contains(
+                str(params["brand"]), case=False, na=False
             )
         ]
 
     return filtered
+
 
 
 # =====================================================
