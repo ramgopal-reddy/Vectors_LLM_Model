@@ -181,27 +181,39 @@ def apply_filters(dataframe, params):
 
     filtered = dataframe
 
+    # 1️⃣ Numeric Filters (Safe but strict)
     if params.get("max_price") is not None:
-        filtered = filtered[filtered["price"] <= float(params["max_price"])]
+        temp = filtered[filtered["price"] <= float(params["max_price"])]
+        if not temp.empty:
+            filtered = temp
 
     if params.get("min_rating") is not None:
-        filtered = filtered[filtered["rating"] >= float(params["min_rating"])]
+        temp = filtered[filtered["rating"] >= float(params["min_rating"])]
+        if not temp.empty:
+            filtered = temp
 
+    # 2️⃣ Category Filter (Soft)
     if params.get("category"):
-        filtered = filtered[
+        temp = filtered[
             filtered["clean_category"].astype(str).str.contains(
                 str(params["category"]), case=False, na=False
             )
         ]
+        if not temp.empty:
+            filtered = temp
 
+    # 3️⃣ Brand Filter (Soft)
     if params.get("brand"):
-        filtered = filtered[
+        temp = filtered[
             filtered["supplier_name"].astype(str).str.contains(
                 str(params["brand"]), case=False, na=False
             )
         ]
+        if not temp.empty:
+            filtered = temp
 
     return filtered
+
 
 
 # =====================================================
@@ -221,9 +233,18 @@ def perform_search(user_query: str):
     candidates = df.iloc[indices[0]].copy()
     candidates["similarity"] = scores[0]
 
+
+    fallback_used = False
+    
     filtered = apply_filters(candidates, params)
 
+# 🔥 Fallback: if everything filtered out, use semantic-only
+    if filtered.empty:
+        filtered = candidates.copy()
+        fallback_used = True
+
     filtered = filtered.sort_values("similarity", ascending=False)
+
 
     results = []
 
@@ -239,8 +260,10 @@ def perform_search(user_query: str):
     return {
         "query": user_query,
         "parsed_params": params,
+        "fallback_used": fallback_used,
         "results": results
     }
+
 
 
 # =====================================================
