@@ -1,10 +1,12 @@
 import os
 import json
 import re
+import hashlib
 import requests
 import numpy as np
 import pandas as pd
 import faiss
+from functools import lru_cache
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -18,10 +20,10 @@ import google.generativeai as genai
 GENAI_API_KEY = os.getenv("GENAI_API_KEY")
 CLOUDFLARE_URL = os.getenv("CLOUDFLARE_URL")
 
-FAISS_INDEX_PATH = "flipkart_index1.faiss"
-DATA_PATH = "flipkart_data1.pkl"
+FAISS_INDEX_PATH = "bge_index.faiss"
+DATA_PATH = "bge_data.pkl"
 
-TOP_K = 5
+TOP_K = 20
 
 if not GENAI_API_KEY:
     raise RuntimeError("GENAI_API_KEY not set")
@@ -33,7 +35,7 @@ genai.configure(api_key=GENAI_API_KEY)
 
 
 # =====================================================
-# APP INIT
+# APP INIT (Cache-AG Global Cache)
 # =====================================================
 
 app = FastAPI()
@@ -44,7 +46,7 @@ gemini_model = None
 
 
 # =====================================================
-# LOAD LIGHTWEIGHT COMPONENTS ON STARTUP
+# STARTUP LOAD (Cache-AG Core)
 # =====================================================
 
 @app.on_event("startup")
@@ -56,6 +58,13 @@ def load_data():
 
     print("Loading dataset...")
     df = pd.read_pickle(DATA_PATH)
+
+    # Ensure numeric types once (not per request)
+    if "price" in df.columns:
+        df["price"] = pd.to_numeric(df["price"], errors="coerce")
+
+    if "rating" in df.columns:
+        df["rating"] = pd.to_numeric(df["rating"], errors="coerce")
 
     print("Loading Gemini model...")
     gemini_model = genai.GenerativeModel("gemini-2.5-flash")
@@ -72,13 +81,22 @@ class QueryRequest(BaseModel):
 
 
 # =====================================================
+# LRU QUERY CACHE (Cache-AG Layer 1)
+# =====================================================
+
+@lru_cache(maxsize=256)
+def cached_search(query_text: str):
+    return perform_search(query_text)
+
+
+# =====================================================
 # GEMINI PARAM EXTRACTION
 # =====================================================
 
 def extract_query_params(user_query: str):
 
     prompt = f"""
-    Extract structured shopping parameters from the query.
+    Extract structured shopping parameters.
     Return ONLY valid JSON.
 
     Query: "{user_query}"
@@ -93,7 +111,6 @@ def extract_query_params(user_query: str):
     }}
     """
 
-# =====================================================
 
     response = gemini_model.generate_content(prompt)
     text = response.text.strip()
@@ -117,10 +134,17 @@ def extract_query_params(user_query: str):
 
 
 # =====================================================
-# CLOUDFLARE EMBEDDING CALL
+# EMBEDDING CACHE (Cache-AG Layer 2)
 # =====================================================
 
+embedding_cache = {}
+
 def get_embedding(text: str):
+
+    key = hashlib.md5(text.encode()).hexdigest()
+
+    if key in embedding_cache:
+        return embedding_cache[key]
 
     try:
         response = requests.post(
@@ -128,14 +152,22 @@ def get_embedding(text: str):
             json={"text": text},
             timeout=10
         )
-
         response.raise_for_status()
 
-        data = response.json()
+        vector = np.array(response.json()["data"][0]).astype("float32")
 
-        vector = data["data"][0]
+        # Normalize for cosine similarity
+        norm = np.linalg.norm(vector)
+        if norm > 0:
+            vector = vector / norm
 
-        return np.array(vector).astype("float32")
+        embedding_cache[key] = vector
+
+        # prevent unlimited growth
+        if len(embedding_cache) > 1000:
+            embedding_cache.clear()
+
+        return vector
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Embedding error: {str(e)}")
@@ -147,16 +179,8 @@ def get_embedding(text: str):
 
 def apply_filters(dataframe, params):
 
-    filtered = dataframe.copy()
+    filtered = dataframe
 
-    # Ensure numeric columns are properly typed
-    if "price" in filtered.columns:
-        filtered["price"] = pd.to_numeric(filtered["price"], errors="coerce")
-
-    if "rating" in filtered.columns:
-        filtered["rating"] = pd.to_numeric(filtered["rating"], errors="coerce")
-
-    # Apply filters safely
     if params.get("max_price") is not None:
         filtered = filtered[filtered["price"] <= float(params["max_price"])]
 
@@ -180,46 +204,43 @@ def apply_filters(dataframe, params):
     return filtered
 
 
-
 # =====================================================
-# CONFIDENCE SCORING
+# CORE SEARCH LOGIC
 # =====================================================
 
-def rank_results(candidates, distances, params):
+def perform_search(user_query: str):
+
+    params = extract_query_params(user_query)
+    semantic_text = params.get("product") or user_query
+
+    query_vector = get_embedding(semantic_text).reshape(1, -1)
+
+    # Cosine similarity search (IndexFlatIP)
+    scores, indices = faiss_index.search(query_vector, k=TOP_K)
+
+    candidates = df.iloc[indices[0]].copy()
+    candidates["similarity"] = scores[0]
+
+    filtered = apply_filters(candidates, params)
+
+    filtered = filtered.sort_values("similarity", ascending=False)
 
     results = []
 
-    for idx, row in candidates.iterrows():
-
-        distance = distances.get(idx, 1)
-        semantic_score = 1 / (1 + distance)
-
-        rating_score = float(row.get("rating", 0)) / 5 if row.get("rating") else 0.5
-
-        price_score = 0.5
-        if params.get("max_price") and row.get("price"):
-            if row["price"] <= params["max_price"]:
-                price_score = 1 - (row["price"] / params["max_price"])
-            else:
-                price_score = 0
-
-        final_score = (
-            0.6 * semantic_score +
-            0.2 * rating_score +
-            0.2 * price_score
-        )
-
+    for _, row in filtered.head(TOP_K).iterrows():
         results.append({
             "product_name": row.get("product_name"),
             "price": row.get("price"),
             "rating": row.get("rating"),
             "brand": row.get("supplier_name"),
-            "confidence_score": round(float(final_score), 4)
+            "similarity_score": round(float(row["similarity"]), 4)
         })
 
-    results = sorted(results, key=lambda x: x["confidence_score"], reverse=True)
-
-    return results[:TOP_K]
+    return {
+        "query": user_query,
+        "parsed_params": params,
+        "results": results
+    }
 
 
 # =====================================================
@@ -228,28 +249,7 @@ def rank_results(candidates, distances, params):
 
 @app.post("/search")
 def search_products(request: QueryRequest):
-
-    params = extract_query_params(request.query)
-
-    semantic_text = params.get("product") or request.query
-
-    query_vector = get_embedding(semantic_text).reshape(1, -1)
-
-    D, I = faiss_index.search(query_vector, k=20)
-
-    candidates = df.iloc[I[0]].copy()
-
-    distances = dict(zip(candidates.index, D[0]))
-
-    filtered = apply_filters(candidates, params)
-
-    ranked = rank_results(filtered, distances, params)
-
-    return {
-        "query": request.query,
-        "parsed_params": params,
-        "results": ranked
-    }
+    return cached_search(request.query)
 
 
 # =====================================================
@@ -258,4 +258,7 @@ def search_products(request: QueryRequest):
 
 @app.get("/")
 def health():
-    return {"status": "API running"}
+    return {
+        "status": "API running",
+        "vectors": faiss_index.ntotal
+    }
