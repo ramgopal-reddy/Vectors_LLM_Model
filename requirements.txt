@@ -1,9 +1,8 @@
 fastapi
 uvicorn
 gunicorn
-pandas
 numpy
+pandas
 faiss-cpu
-sentence-transformers
+requests
 google-generativeai
-torch

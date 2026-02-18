@@ -1,49 +1,57 @@
 import os
-import re
 import json
+import re
+import hashlib
+import requests
 import numpy as np
 import pandas as pd
 import faiss
-from fastapi import FastAPI
+from functools import lru_cache
+
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from sentence_transformers import SentenceTransformer
 import google.generativeai as genai
 
-# ==============================
+
+# =====================================================
 # CONFIG
-# ==============================
+# =====================================================
 
 GENAI_API_KEY = os.getenv("GENAI_API_KEY")
-FAISS_INDEX_PATH = "flipkart_index1.faiss"
-DATA_PATH = "flipkart_data1.pkl"
+CLOUDFLARE_URL = os.getenv("CLOUDFLARE_URL")
+
+FAISS_INDEX_PATH = "bge_index.faiss"
+DATA_PATH = "bge_data.pkl"
+
+TOP_K = 20
+
+if not GENAI_API_KEY:
+    raise RuntimeError("GENAI_API_KEY not set")
+
+if not CLOUDFLARE_URL:
+    raise RuntimeError("CLOUDFLARE_URL not set")
 
 genai.configure(api_key=GENAI_API_KEY)
 
-# ==============================
-# GLOBAL CACHE (Cache-AG Method)
-# ==============================
+
+# =====================================================
+# APP INIT (Cache-AG Global Cache)
+# =====================================================
 
 app = FastAPI()
 
-embedding_model = None
 faiss_index = None
 df = None
 gemini_model = None
 
 
-# ==============================
-# STARTUP LOAD (Runs Once)
-# ==============================
+# =====================================================
+# STARTUP LOAD (Cache-AG Core)
+# =====================================================
 
 @app.on_event("startup")
-def load_models():
-    global embedding_model, faiss_index, df, gemini_model
-
-    print("Loading embedding model...")
-    embedding_model = SentenceTransformer(
-        "paraphrase-MiniLM-L3-v2",
-        device="cpu"
-    )
+def load_data():
+    global faiss_index, df, gemini_model
 
     print("Loading FAISS index...")
     faiss_index = faiss.read_index(FAISS_INDEX_PATH)
@@ -51,27 +59,44 @@ def load_models():
     print("Loading dataset...")
     df = pd.read_pickle(DATA_PATH)
 
+    # Ensure numeric types once (not per request)
+    if "price" in df.columns:
+        df["price"] = pd.to_numeric(df["price"], errors="coerce")
+
+    if "rating" in df.columns:
+        df["rating"] = pd.to_numeric(df["rating"], errors="coerce")
+
     print("Loading Gemini model...")
     gemini_model = genai.GenerativeModel("gemini-2.5-flash")
 
-    print("✅ All models loaded successfully")
+    print("✅ Startup complete")
 
 
-# ==============================
+# =====================================================
 # REQUEST MODEL
-# ==============================
+# =====================================================
 
 class QueryRequest(BaseModel):
     query: str
 
 
-# ==============================
+# =====================================================
+# LRU QUERY CACHE (Cache-AG Layer 1)
+# =====================================================
+
+@lru_cache(maxsize=256)
+def cached_search(query_text: str):
+    return perform_search(query_text)
+
+
+# =====================================================
 # GEMINI PARAM EXTRACTION
-# ==============================
+# =====================================================
 
 def extract_query_params(user_query: str):
+
     prompt = f"""
-    Extract structured parameters from the user query.
+    Extract structured shopping parameters.
     Return ONLY valid JSON.
 
     Query: "{user_query}"
@@ -85,12 +110,14 @@ def extract_query_params(user_query: str):
       "brand": string or null
     }}
     """
-# ==============================
+
+
     response = gemini_model.generate_content(prompt)
     text = response.text.strip()
 
     text = re.sub(r"```json|```", "", text).strip()
     match = re.search(r"\{.*\}", text, re.DOTALL)
+
     if match:
         text = match.group(0)
 
@@ -106,125 +133,132 @@ def extract_query_params(user_query: str):
         }
 
 
-# ==============================
+# =====================================================
+# EMBEDDING CACHE (Cache-AG Layer 2)
+# =====================================================
+
+embedding_cache = {}
+
+def get_embedding(text: str):
+
+    key = hashlib.md5(text.encode()).hexdigest()
+
+    if key in embedding_cache:
+        return embedding_cache[key]
+
+    try:
+        response = requests.post(
+            CLOUDFLARE_URL,
+            json={"text": text},
+            timeout=10
+        )
+        response.raise_for_status()
+
+        vector = np.array(response.json()["data"][0]).astype("float32")
+
+        # Normalize for cosine similarity
+        norm = np.linalg.norm(vector)
+        if norm > 0:
+            vector = vector / norm
+
+        embedding_cache[key] = vector
+
+        # prevent unlimited growth
+        if len(embedding_cache) > 1000:
+            embedding_cache.clear()
+
+        return vector
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Embedding error: {str(e)}")
+
+
+# =====================================================
 # FILTERING
-# ==============================
+# =====================================================
 
 def apply_filters(dataframe, params):
-    filtered = dataframe.copy()
 
-    if params.get("max_price"):
-        filtered = filtered[filtered["price"] <= params["max_price"]]
+    filtered = dataframe
 
-    if params.get("min_rating"):
-        filtered = filtered[filtered["rating"] >= params["min_rating"]]
+    if params.get("max_price") is not None:
+        filtered = filtered[filtered["price"] <= float(params["max_price"])]
+
+    if params.get("min_rating") is not None:
+        filtered = filtered[filtered["rating"] >= float(params["min_rating"])]
 
     if params.get("category"):
         filtered = filtered[
-            filtered["clean_category"].str.contains(
-                params["category"], case=False, na=False
+            filtered["clean_category"].astype(str).str.contains(
+                str(params["category"]), case=False, na=False
             )
         ]
 
     if params.get("brand"):
         filtered = filtered[
-            filtered["supplier_name"].str.contains(
-                params["brand"], case=False, na=False
+            filtered["supplier_name"].astype(str).str.contains(
+                str(params["brand"]), case=False, na=False
             )
         ]
 
     return filtered
 
 
-# ==============================
-# CONFIDENCE SCORING
-# ==============================
+# =====================================================
+# CORE SEARCH LOGIC
+# =====================================================
 
-def compute_confidence_scores(candidates, distances, params):
-    results = []
+def perform_search(user_query: str):
 
-    for idx, row in candidates.iterrows():
-        distance = distances.get(idx, 1)
+    params = extract_query_params(user_query)
+    semantic_text = params.get("product") or user_query
 
-        semantic_score = 1 / (1 + distance)
+    query_vector = get_embedding(semantic_text).reshape(1, -1)
 
-        try:
-            rating_score = float(row["rating"]) / 5
-        except:
-            rating_score = 0.5
+    # Cosine similarity search (IndexFlatIP)
+    scores, indices = faiss_index.search(query_vector, k=TOP_K)
 
-        price_score = 0.5
-        if params.get("max_price") and row["price"]:
-            if row["price"] <= params["max_price"]:
-                price_score = 1 - (row["price"] / params["max_price"])
-            else:
-                price_score = 0
-
-        brand_score = 0.5
-        if params.get("brand"):
-            brand_score = (
-                1
-                if params["brand"].lower() in row["supplier_name"].lower()
-                else 0
-            )
-
-        final_score = (
-            0.5 * semantic_score
-            + 0.2 * rating_score
-            + 0.2 * price_score
-            + 0.1 * brand_score
-        )
-
-        results.append({
-            "product_name": row["product_name"],
-            "price": row["price"],
-            "rating": row["rating"],
-            "brand": row["supplier_name"],
-            "confidence_score": round(float(final_score), 4)
-        })
-
-    results = sorted(results, key=lambda x: x["confidence_score"], reverse=True)
-
-    return results[:5]
-
-
-# ==============================
-# SEARCH ENDPOINT
-# ==============================
-
-@app.post("/search")
-def search_products(request: QueryRequest):
-
-    params = extract_query_params(request.query)
-
-    semantic_text = params.get("product") or request.query
-
-    query_vector = embedding_model.encode([semantic_text])
-    D, I = faiss_index.search(
-        np.array(query_vector).astype("float32"), k=20
-    )
-
-    candidates = df.iloc[I[0]].copy()
-
-    distances = dict(zip(candidates.index, D[0]))
+    candidates = df.iloc[indices[0]].copy()
+    candidates["similarity"] = scores[0]
 
     filtered = apply_filters(candidates, params)
 
-    ranked_results = compute_confidence_scores(
-        filtered, distances, params
-    )
+    filtered = filtered.sort_values("similarity", ascending=False)
+
+    results = []
+
+    for _, row in filtered.head(TOP_K).iterrows():
+        results.append({
+            "product_name": row.get("product_name"),
+            "price": row.get("price"),
+            "rating": row.get("rating"),
+            "brand": row.get("supplier_name"),
+            "similarity_score": round(float(row["similarity"]), 4)
+        })
 
     return {
-        "query": request.query,
+        "query": user_query,
         "parsed_params": params,
-        "results": ranked_results
+        "results": results
     }
 
 
-# ==============================
+# =====================================================
+# SEARCH ENDPOINT
+# =====================================================
+
+@app.post("/search")
+def search_products(request: QueryRequest):
+    return cached_search(request.query)
+
+
+# =====================================================
 # HEALTH CHECK
-# ==============================
+# =====================================================
 
 @app.get("/")
-def root():
-    return {"status": "API running"}
+def health():
+    return {
+        "status": "API running",
+        "vectors": faiss_index.ntotal
+    }
