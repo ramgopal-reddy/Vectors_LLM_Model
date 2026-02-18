@@ -250,27 +250,27 @@ def perform_search(user_query: str):
 
     for _, row in filtered.head(TOP_K).iterrows():
 
-    price = row.get("price")
-    rating = row.get("rating")
-
-    # Fix NaN for JSON
-    if pd.isna(price):
-        price = None
-    else:
-        price = float(price)
-
-    if pd.isna(rating):
-        rating = None
-    else:
-        rating = float(rating)
-
-    results.append({
-        "product_name": row.get("product_name"),
-        "price": price,
-        "rating": rating,
-        "brand": row.get("supplier_name"),
-        "similarity_score": round(float(row["similarity"]), 4)
-    })
+        price = row.get("price")
+        rating = row.get("rating")
+    
+        # Fix NaN for JSON
+        if pd.isna(price):
+            price = None
+        else:
+            price = float(price)
+    
+        if pd.isna(rating):
+            rating = None
+        else:
+            rating = float(rating)
+    
+        results.append({
+            "product_name": row.get("product_name"),
+            "price": price,
+            "rating": rating,
+            "brand": row.get("supplier_name"),
+            "similarity_score": round(float(row["similarity"]), 4)
+        })
 
 
     return {
